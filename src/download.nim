@@ -5,6 +5,7 @@ import asyncstreams
 import strutils
 import math
 import options
+import uri
 import ./client
 
 const BufSize = 1 shl 20  # 1 MiB
@@ -13,6 +14,7 @@ type
   ResourceInfo* = object
     supportsRange*: bool
     contentLength*: Option[int]
+    filename*: string
 
   # DownloadResult* = object
   #   success*: bool
@@ -41,6 +43,17 @@ proc `and`[T](s: seq[T]): bool =
 #   let spl3 = spl2[0].split('-')
 #   result.rangeStart = spl3[0].parseInt
 #   result.rangeEnd = spl3[1].parseInt
+
+proc parseContentDisposition(contentDisposition: string): Option[string] =
+  let
+    spl1 = contentDisposition.split("; ")
+    dispositionType = spl1[0]
+  if dispositionType != "attachment":
+    return none(string)
+  var filename = spl1[1].split('=')[1]
+  if filename[0] == '"' and filename[filename.high] == '"':
+    filename = filename.substr(1, filename.high - 1)
+  return some(filename)
 
 proc resourceSupportsRangeRequests(headers: HttpHeaders): bool =
   if not headers.hasKey("Accept-Ranges"):
@@ -72,16 +85,34 @@ proc guessContentLength(url: string): Future[int] {.async.} =
 
   return curGuess
 
+proc getFilename(url: string): string =
+  let
+    uri = url.parseUri
+    path = uri.path.split('/')
+  path[path.len - 1]
+
 proc getResourceInfo(url: string): Future[ResourceInfo] {.async.} =
+  var ri = ResourceInfo()
   let headers = (await client().head(url)).headers
-  return ResourceInfo(
-    supportsRange: resourceSupportsRangeRequests(headers),
-    contentLength:
-      if headers.hasKey("Content-Length"):
-        some(headers["Content-Length"].parseInt)
-      else:
-        none(int)
-  )
+
+  ri.supportsRange = resourceSupportsRangeRequests(headers)
+
+  ri.contentLength =
+    if headers.hasKey("Content-Length"):
+      some(headers["Content-Length"].parseInt)
+    else:
+      none(int)
+
+  var gotFilename = false
+  if headers.hasKey("Content-Disposition"):
+    let filename = parseContentDisposition(headers["Content-Disposition"])
+    if filename.isSome:
+      ri.filename = filename.get
+      gotFilename = true
+  if not gotFilename:
+    ri.filename = getFilename(url)
+
+  return ri
 
 proc writeRangeToFile(file: File; filePosOrigin: int; response: AsyncResponse): Future[bool] {.async.} =
   var
@@ -123,7 +154,7 @@ proc download*(url: string; n = 1): Future[DownloadResult] {.async.} =
     contentLength = await guessContentLength(url)
     echo "GUESSED CONTENT-LENGTH AS ", contentLength
 
-  let file = open("myfile", fmWrite)
+  let file = open(resourceInfo.filename, fmWrite)
   var writers: seq[Future[bool]]
 
   let rangeSize = ceil(contentLength / n).int
