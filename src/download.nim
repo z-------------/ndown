@@ -6,20 +6,17 @@ import strutils
 import math
 import options
 import uri
+import locks
 import ./client
 
-const BufSize = 1 shl 20  # 1 MiB
+var mutex: Lock
+mutex.initLock()
 
 type
   ResourceInfo* = object
     supportsRange*: bool
     contentLength*: Option[int]
     filename*: string
-
-  # DownloadResult* = object
-  #   success*: bool
-  #   filename*: string
-  #   httpStatus*: string
 
   DownloadResult* = bool
 
@@ -29,20 +26,7 @@ type
     rangeEnd*: int
     contentLength*: int
 
-proc `and`[T](s: seq[T]): bool =
-  for item in s:
-    if not bool(item):
-      return false
-  return true
-
-# proc parseContentRange(contentRange: string): ContentRangeInfo =
-#   let spl1 = contentRange.split(' ')
-#   result.unit = spl1[0]
-#   let spl2 = spl1[1].split('/')
-#   result.contentLength = spl2[1].parseInt
-#   let spl3 = spl2[0].split('-')
-#   result.rangeStart = spl3[0].parseInt
-#   result.rangeEnd = spl3[1].parseInt
+  ThreadArgs = tuple[url: string; f: File; rStart, rEnd: int]
 
 proc parseContentDisposition(contentDisposition: string): Option[string] =
   let
@@ -114,30 +98,28 @@ proc getResourceInfo(url: string): Future[ResourceInfo] {.async.} =
 
   return ri
 
-proc writeRangeToFile(file: File; filePosOrigin: int; response: AsyncResponse): Future[bool] {.async.} =
+proc threadProc(args: ThreadArgs) {.thread.} =
+  let
+    url = args.url
+    file = args.f
+    rangeStart = args.rStart
+    rangeEnd = args.rEnd
+    headers = newHttpHeaders({
+      "Range": "bytes=" & $rangeStart & "-" & $rangeEnd
+    })
+    responseFut = client().request(url, HttpGet, headers = headers)
+    response = waitFor responseFut
   var
-    buf: array[BufSize, uint8]
-    bufPos = 0
-    filePos = filePosOrigin
-
-  while true:
-    let (hasMore, data) = await response.bodyStream.read()
-
-    for c in data:
-      buf[bufPos] = uint8(c)
-      bufPos.inc
-
-    if (not hasMore) or (bufPos + data.len > BufSize):  # assuming that data.len is always the same
-      echo "writing ", bufPos, " bytes to file at position ", filePos
-      file.setFilePos(filePos)
-      let bytesWritten = file.writeBytes(buf, 0, bufPos)
-      if bytesWritten < bufPos:
-        echo "NOT WHOLE BUFFER WRITTEN! ", bytesWritten, " / ", bufPos
-      filePos += bufPos
-      bufPos = 0
-
-    if not hasMore:
-      break
+    hasMore = true
+    filePos = rangeStart
+  while hasMore:
+    let readResult = waitFor response.bodyStream.read()
+    hasMore = readResult[0]
+    mutex.acquire()
+    file.setFilePos(filePos)
+    file.write(readResult[1])
+    mutex.release()
+    filePos += readResult[1].len
 
 proc download*(url: string; n = 1): Future[DownloadResult] {.async.} =
   var n = n
@@ -146,6 +128,7 @@ proc download*(url: string; n = 1): Future[DownloadResult] {.async.} =
   var contentLength: int
 
   if not resourceInfo.supportsRange:
+    echo "RESOURCE DOESN'T SUPPORT RANGE"
     n = 1
 
   if resourceInfo.contentLength.isSome:
@@ -155,7 +138,10 @@ proc download*(url: string; n = 1): Future[DownloadResult] {.async.} =
     echo "GUESSED CONTENT-LENGTH AS ", contentLength
 
   let file = open(resourceInfo.filename, fmWrite)
-  var writers: seq[Future[bool]]
+  var
+    writers = newSeq[Thread[ThreadArgs]](n)
+    writerIdx = 0
+    ranges: seq[(int, int)]
 
   let rangeSize = ceil(contentLength / n).int
   var curRange = 0
@@ -163,22 +149,14 @@ proc download*(url: string; n = 1): Future[DownloadResult] {.async.} =
     let
       rangeStart = curRange * rangeSize
       rangeEnd = min(rangeStart + rangeSize, contentLength) - 1
-      headers = newHttpHeaders({
-        "Range": "bytes=" & $rangeStart & "-" & $rangeEnd
-      })
-      response = await client().request(url, HttpGet, headers = headers)
-
-    let w = writeRangeToFile(file, rangeStart, response)
-    writers.add(w)
+    ranges.add((rangeStart, rangeEnd))
     curRange.inc
-
-  let stati = await all(writers)
-  return stati.and
-
-# when isMainModule:
-#   # const Url = "https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_1080p_stereo.ogg"
-#   # const Url = "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4"
-#   # const Url = "https://github.com/FredJul/Flym/archive/v2.4.0.zip"
-#   const Url = "https://github.com/gpodder/gpodder/releases/download/3.10.16/windows-gpodder-3.10.16-installer.exe"
-
-#   let downloadResult = waitFor download(Url, 2)
+  
+  while ranges.len > 0:
+    let (rangeStart, rangeEnd) = ranges[0]
+    ranges.delete(0)
+    createThread(writers[writerIdx], threadProc, (url, file, rangeStart, rangeEnd))
+    writerIdx = (writerIdx + 1) mod n
+  
+  for thread in writers:
+    thread.joinThread()
